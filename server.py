@@ -1,10 +1,14 @@
+# Imports do servidor
 from flask import Flask, request, jsonify
 from tinydb import TinyDB, Query
 import hashlib
 import time
 
-db = TinyDB('licenses.json') 
+# O objeto 'app' precisa estar no escopo global para o Gunicorn
 app = Flask(__name__)
+
+# O banco de dados será um arquivo JSON chamado 'licenses.json'
+db = TinyDB('licenses.json') 
 
 # Rota para ativar uma licença
 @app.route('/api/v1/activate', methods=['POST'])
@@ -63,11 +67,12 @@ def generate_key():
     print(f"Nova chave gerada: {new_key}") 
     return jsonify({"success": True, "key": new_key}), 200
 
-# NOVO: Rota para visualizar todas as licenças
+# Rota para visualizar todas as licenças
 @app.route('/api/v1/licenses', methods=['GET'])
 def get_all_licenses():
     licenses = db.all()
     return jsonify(licenses), 200
 
+# Para testes locais, o Gunicorn no Render ignora isso
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

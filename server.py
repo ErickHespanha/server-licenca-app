@@ -99,6 +99,24 @@ def revoke_license():
     finally:
         session.close()
 
+# NOVO: Rota para deletar uma licença
+@app.route('/api/v1/licenses/<license_key>', methods=['DELETE'])
+def delete_license(license_key):
+    session = Session()
+    try:
+        license_record = session.query(License).filter_by(key=license_key).first()
+        if not license_record:
+            return jsonify({"success": False, "message": "Chave de licença não encontrada."}), 404
+        
+        session.delete(license_record)
+        session.commit()
+        return jsonify({"success": True, "message": "Licença deletada com sucesso."}), 200
+    except Exception as e:
+        session.rollback()
+        return jsonify({"success": False, "message": f"Erro interno no servidor: {e}"}), 500
+    finally:
+        session.close()
+
 # Rota de administrador para gerar chaves
 @app.route('/api/v1/generate_key', methods=['POST'])
 def generate_key():
@@ -122,7 +140,6 @@ def get_all_licenses():
     session = Session()
     try:
         licenses = session.query(License).all()
-        # Converte os objetos do banco de dados para um formato JSON
         licenses_list = [{
             'key': lic.key,
             'status': lic.status,

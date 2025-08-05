@@ -1,1 +1,8 @@
+GERAR LICENÇAS
+
 curl --ssl-no-revoke -X POST https://server-licenca-app.onrender.com/api/v1/generate_key
+
+
+VERIFICAR LICENSAS
+
+curl --ssl-no-revoke https://server-licenca-app.onrender.com/api/v1/licenses

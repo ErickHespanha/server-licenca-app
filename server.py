@@ -3,9 +3,7 @@ from tinydb import TinyDB, Query
 import hashlib
 import time
 
-# O banco de dados será um arquivo JSON chamado 'licenses.json'
 db = TinyDB('licenses.json') 
-
 app = Flask(__name__)
 
 # Rota para ativar uma licença
@@ -24,7 +22,6 @@ def activate_license():
     if not license_record:
         return jsonify({"success": False, "message": "Chave de licença inválida."}), 401
 
-    # NOVO: Verifica se a licença foi revogada
     if license_record.get('revoked', False):
         return jsonify({"success": False, "message": "Esta licença foi revogada."}), 403
 
@@ -37,7 +34,7 @@ def activate_license():
 
     return jsonify({"success": True, "message": "Licença já está ativa neste computador."}), 200
 
-# NOVO: Rota para revogar uma licença manualmente
+# Rota para revogar uma licença manualmente
 @app.route('/api/v1/revoke', methods=['POST'])
 def revoke_license():
     data = request.get_json()
@@ -62,10 +59,15 @@ def revoke_license():
 @app.route('/api/v1/generate_key', methods=['POST'])
 def generate_key():
     new_key = hashlib.sha256(str(time.time()).encode()).hexdigest()
-    # Adicione a flag 'revoked' como False por padrão
     db.insert({'key': new_key, 'status': 'inactive', 'revoked': False})
     print(f"Nova chave gerada: {new_key}") 
     return jsonify({"success": True, "key": new_key}), 200
+
+# NOVO: Rota para visualizar todas as licenças
+@app.route('/api/v1/licenses', methods=['GET'])
+def get_all_licenses():
+    licenses = db.all()
+    return jsonify(licenses), 200
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

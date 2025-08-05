@@ -1,3 +1,4 @@
 Flask
 gunicorn
-tinydb
+SQLAlchemy
+psycopg2-binary

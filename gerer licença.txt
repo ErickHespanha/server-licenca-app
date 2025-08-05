@@ -6,3 +6,20 @@ curl --ssl-no-revoke -X POST https://server-licenca-app.onrender.com/api/v1/gene
 VERIFICAR LICENSAS
 
 curl --ssl-no-revoke https://server-licenca-app.onrender.com/api/v1/licenses
+
+
+Revogar licença
+
+curl --ssl-no-revoke -X POST -H "Content-Type: application/json" -d '{"license_key":"[SUA_CHAVE_AQUI]"}' https://server-licenca-app.onrender.com/api/v1/revoke
+
+
+DELETARr licença
+
+curl --ssl-no-revoke -X DELETE https://server-licenca-app.onrender.com/api/v1/licenses/[SUA_CHAVE_AQUI]
+
+
+
+
+CRIAR EXE
+
+pyinstaller --onefile --windowed --icon=icone.ico alertafinal.py

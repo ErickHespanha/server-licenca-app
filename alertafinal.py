@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import datetime
+import platform
 
 from iqoptionapi.stable_api import IQ_Option
 from colorama import init, Fore, Style
@@ -41,11 +42,14 @@ DEFAULT_ATIVOS_PARA_ANALISE = [
 # Parâmetros da Estratégia EMA (Fixa)
 DEFAULT_EMA_CURTA = 3
 DEFAULT_EMA_LONGA = 33
-DEFAULT_QTD_VELAS_ANALISE = 400 # Quantidade de velas para análise (garante histórico para EMAs e reversões)
-DEFAULT_MAX_VELAS_REVERSAO = 5 # Quantidade máxima de velas a serem verificadas para reversão após o cruzamento
+DEFAULT_QTD_VELAS_ANALISE = 400
+DEFAULT_MAX_VELAS_REVERSAO = 5
 
 # --- CONFIGURAÇÃO DO SISTEMA DE LICENÇA ---
 LICENSE_SERVER_URL = "https://server-licenca-app.onrender.com/api/v1/activate"
+LICENSE_SERVER_VALIDATE_URL = "https://server-licenca-app.onrender.com/api/v1/licenses"
+LICENSE_FILE = 'license.dat'
+VALIDATION_PERIOD_MINUTES = 1 # Para teste, mude para 60 * 24 para checar a cada 24h em produção.
 
 # --- END GLOBAL CONFIGURATIONS ---
 
@@ -61,16 +65,17 @@ class BotConfig:
         self.account_type = DEFAULT_ACCOUNT_TYPE
         self.timeframe = DEFAULT_TIMEFRAME
         self.ativos_para_analise = DEFAULT_ATIVOS_PARA_ANALISE
-
         self.ema_curta = DEFAULT_EMA_CURTA
         self.ema_longa = DEFAULT_EMA_LONGA
         self.qtd_velas_analise = DEFAULT_QTD_VELAS_ANALISE
-        self.max_velas_reversao = DEFAULT_MAX_VELAS_REVERSAO 
-            
+        self.max_velas_reversao = DEFAULT_MAX_VELAS_REVERSAO
         self.last_cross_time = defaultdict(float)
         self.historico_reversoes_cruzamento = []
-        self.max_historico_reversoes = 5 
+        self.max_historico_reversoes = 5
         self.monitorando_reversao = {}
+        # NOVO: Cache de análise histórica de reversões
+        self.historico_reversao_cache = defaultdict(list)
+        self.media_reversao_cache = defaultdict(int)
 
 bot_config = BotConfig()
 
@@ -80,11 +85,10 @@ parar_bot_event = threading.Event()
 ativos_sem_velas = defaultdict(int)
 ativos_sem_velas_lock = threading.Lock()
 
-# --- FUNÇÕES DE ATIVAÇÃO E GERENCIAMENTO DE LICENÇA ---
+# --- FUNÇÕES DE VALIDAÇÃO E GERENCIAMENTO DE LICENÇA ---
 def get_device_id():
-    """Gera um ID de dispositivo único e consistente."""
     try:
-        system_info = f"{platform.node()}-{platform.system()}-{platform.release()}-{uuid.getnode()}"
+        system_info = f"{platform.node()}-{platform.processor()}-{platform.system()}-{platform.machine()}"
         device_id = hashlib.sha256(system_info.encode()).hexdigest()
         return device_id
     except Exception as e:
@@ -92,7 +96,7 @@ def get_device_id():
         return None
 
 class LicenseManager:
-    def __init__(self, filename="license.dat"):
+    def __init__(self, filename=LICENSE_FILE):
         self.filename = filename
         self.license_key = None
         self.is_active = False
@@ -100,7 +104,6 @@ class LicenseManager:
         self.load_license()
 
     def load_license(self):
-        """Carrega a licença salva localmente."""
         try:
             with open(self.filename, 'r') as f:
                 data = json.load(f)
@@ -116,7 +119,6 @@ class LicenseManager:
             return False
 
     def save_license(self, key):
-        """Salva a chave de licença no disco e a data da ativação."""
         try:
             self.last_validation = datetime.datetime.now()
             data = {
@@ -131,15 +133,43 @@ class LicenseManager:
         except Exception as e:
             log(f"Falha ao salvar o arquivo de licença: {e}", "ERROR")
 
+    def delete_license_file(self):
+        if os.path.exists(self.filename):
+            os.remove(self.filename)
+            self.license_key = None
+            self.is_active = False
+            self.last_validation = None
+
+def validate_license_on_server(license_key, device_id):
+    try:
+        response = requests.get(LICENSE_SERVER_VALIDATE_URL, timeout=15)
+        response.raise_for_status()
+        licenses = response.json()
+        
+        for lic in licenses:
+            if lic['key'] == license_key:
+                if lic['revoked'] or lic['status'] != 'active' or lic['device_id'] != device_id:
+                    return False, "Licença inválida, revogada ou ativa em outro dispositivo."
+                return True, "Licença validada com sucesso."
+        
+        return False, "Chave de licença não encontrada no servidor."
+        
+    except requests.exceptions.RequestException as e:
+        log(f"Falha na comunicação com o servidor durante a validação: {e}", "ERROR")
+        return True, "Falha na validação. Mantendo a chave local por enquanto."
+    except Exception as e:
+        log(f"Erro inesperado durante a validação da licença: {e}", "ERROR")
+        return True, "Falha na validação. Mantendo a chave local por enquanto."
+
 def validate_license_periodically():
     license_manager = LicenseManager()
     if not license_manager.is_active:
         return True
 
-    days_since_last_validation = (datetime.datetime.now() - license_manager.last_validation).days
+    minutes_since_last_validation = (datetime.datetime.now() - license_manager.last_validation).total_seconds() / 60
     
-    if days_since_last_validation < 7:
-        log(f"Validação periódica não necessária. Última validação há {days_since_last_validation} dias.", "INFO")
+    if minutes_since_last_validation < VALIDATION_PERIOD_MINUTES:
+        log(f"Validação periódica não necessária. Última validação há {minutes_since_last_validation:.2f} minutos.", "INFO")
         return True
 
     log("Tentando revalidar a licença com o servidor...", "INFO")
@@ -147,33 +177,18 @@ def validate_license_periodically():
     if not device_id:
         return False
 
-    try:
-        payload = {
-            "license_key": license_manager.license_key,
-            "device_id": device_id
-        }
-        
-        response = requests.post(LICENSE_SERVER_URL, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            log("Revalidação com o servidor bem-sucedida.", "SUCCESS")
-            license_manager.save_license(license_manager.license_key)
-            return True
-        elif response.status_code == 403 or response.status_code == 401:
-            result = response.json()
-            log(f"A licença foi revogada ou é inválida. Motivo: {result.get('message', 'N/A')}", "ERROR")
-            if os.path.exists(license_manager.filename):
-                os.remove(license_manager.filename)
-            return False
-        else:
-            log("Falha na revalidação. Servidor retornou erro.", "WARNING")
-            return False
-            
-    except requests.exceptions.RequestException as e:
-        log(f"Erro de conexão durante a revalidação: {e}", "ERROR")
+    is_valid, message = validate_license_on_server(license_manager.license_key, device_id)
+    if is_valid:
+        license_manager.save_license(license_manager.license_key) # Atualiza a data de validacao
+        return True
+    else:
+        log(f"Validação periódica falhou: {message}", "ERROR")
+        license_manager.delete_license_file()
+        messagebox.showerror("Licença Inválida", "Sua licença não é mais válida. O programa será encerrado.")
+        os._exit(1)
         return False
 
-def activate_license(license_key):
+def activate_license_on_server(license_key):
     device_id = get_device_id()
     if not device_id:
         return False
@@ -196,7 +211,6 @@ def activate_license(license_key):
 
         if response.status_code == 200:
             if result.get("success"):
-                log("Licença ativada com sucesso!", "SUCCESS")
                 return True
             else:
                 log(f"Falha na ativação: {result.get('message', 'Erro desconhecido')}", "ERROR")
@@ -209,19 +223,7 @@ def activate_license(license_key):
         log(f"Erro de conexão com o servidor de licenças: {e}", "ERROR")
         return False
 
-# --- LOGGING FUNCTION (Modified to send to GUI) ---
-log_lock = threading.Lock()
-LOG_LEVELS = { "INFO": Fore.WHITE, "SUCCESS": Fore.GREEN, "ERROR": Fore.RED, "WARNING": Fore.YELLOW, "ALERT": Fore.CYAN, "STATUS": Fore.MAGENTA, "DEBUG": Fore.LIGHTBLACK_EX }
-
-def log(message, level="INFO"):
-    color = LOG_LEVELS.get(level, Fore.WHITE)
-    timestamp = time.strftime('%H:%M:%S')
-    formatted_message = f"{color}[{timestamp}] {message}{Style.RESET_ALL}"
-    
-    with log_lock:
-        print(formatted_message)
-    
-    update_queue.put(("log", formatted_message))
+# --- FUNÇÕES PRINCIPAIS DO BOT ---
 
 def tocar_som(tipo):
     try:
@@ -255,6 +257,57 @@ def check_ema_crossover_signal(velas):
     elif ema_curta_anterior >= ema_longa_anterior and ema_curta_atual < ema_longa_atual:
         signal = 'put'
     return signal
+
+# NOVO: Função para analisar o histórico de reversões
+def analyze_historical_reversals(api):
+    log("Iniciando análise histórica de reversões...", "INFO")
+    for ativo in bot_config.ativos_para_analise:
+        try:
+            velas_api = api.get_candles(ativo, bot_config.timeframe, 1000, time.time())
+            if not velas_api or len(velas_api) < bot_config.ema_longa + bot_config.max_velas_reversao + 1:
+                continue
+
+            reversal_counts = []
+            closes = [v['close'] for v in velas_api]
+            ema_curta_valores = calcular_ema(closes, bot_config.ema_curta)
+            ema_longa_valores = calcular_ema(closes, bot_config.ema_longa)
+
+            if not ema_curta_valores or not ema_longa_valores:
+                continue
+
+            for i in range(bot_config.ema_longa + 1, len(velas_api) - bot_config.max_velas_reversao):
+                ema_curta_ant = ema_curta_valores[i-1]
+                ema_longa_ant = ema_longa_valores[i-1]
+                ema_curta_atual = ema_curta_valores[i]
+                ema_longa_atual = ema_longa_valores[i]
+
+                signal = None
+                if ema_curta_ant <= ema_longa_ant and ema_curta_atual > ema_longa_atual:
+                    signal = 'call'
+                elif ema_curta_ant >= ema_longa_ant and ema_curta_atual < ema_longa_atual:
+                    signal = 'put'
+
+                if signal:
+                    for j in range(i + 1, i + 1 + bot_config.max_velas_reversao):
+                        if j >= len(velas_api):
+                            break
+                        candle_direction = 'call' if velas_api[j]['close'] > velas_api[j]['open'] else 'put'
+                        if (signal == 'call' and candle_direction == 'put') or (signal == 'put' and candle_direction == 'call'):
+                            reversal_counts.append(j - i)
+                            break
+            
+            if reversal_counts:
+                media_reversao = round(sum(reversal_counts) / len(reversal_counts))
+                bot_config.media_reversao_cache[ativo] = media_reversao
+                log(f"[{ativo}] Média de reversão calculada: {media_reversao} vela(s) após o cruzamento.", "INFO")
+            else:
+                bot_config.media_reversao_cache[ativo] = 0
+
+        except Exception as e:
+            log(f"Erro ao analisar histórico para {ativo}: {e}", "ERROR")
+
+    log("Análise histórica concluída.", "SUCCESS")
+    update_queue.put(("historical_analysis_done", None))
 
 def adicionar_reversao_ao_historico(ativo, direcao_cruzamento, timestamp_cruzamento, timestamp_reversao, velas_para_reverter):
     global bot_config
@@ -321,7 +374,9 @@ def ciclo_principal_alerta_simples(api):
                 sinal_cruzamento = check_ema_crossover_signal(velas_api)
                 if sinal_cruzamento:
                     if bot_config.last_cross_time[ativo] != current_candle_start_time:
-                        log(f"[{ativo}] ALERTA DE CRUZAMENTO EMA {bot_config.ema_curta}/{bot_config.ema_longa}: {sinal_cruzamento.upper()}! (Vela em formação)", "ALERT")
+                        media_reversao = bot_config.media_reversao_cache.get(ativo, 0)
+                        alerta_message = f"[{ativo}] CRUZAMENTO {sinal_cruzamento.upper()}! Reverte em ~{media_reversao} vela(s)."
+                        log(alerta_message, "ALERT")
                         tocar_som('crossover')
                         bot_config.last_cross_time[ativo] = current_candle_start_time
                         bot_config.monitorando_reversao[ativo] = {
@@ -332,7 +387,8 @@ def ciclo_principal_alerta_simples(api):
                             "ativo": ativo,
                             "direcao": sinal_cruzamento.upper(),
                             "estrategia": f"EMA {bot_config.ema_curta}/{bot_config.ema_longa} Cruzamento",
-                            "hora": time.strftime('%H:%M:%S', time.localtime(current_time))
+                            "hora": time.strftime('%H:%M:%S', time.localtime(current_time)),
+                            "reversao_predita": f"~{media_reversao} vela(s)"
                         }))
                 if ativo in bot_config.monitorando_reversao:
                     monitor_info = bot_config.monitorando_reversao[ativo]
@@ -409,6 +465,9 @@ def iniciar_bot_thread_alerta_simples():
 
     log("Conectado com sucesso!", "SUCCESS")
     update_queue.put(("connection_status", "Conectado"))
+    
+    # Inicia a análise histórica de reversões
+    threading.Thread(target=analyze_historical_reversals, args=(api,), daemon=True).start()
 
     if api.change_balance(bot_config.account_type):
         log(f"Conta alterada para {bot_config.account_type}.", "INFO")
@@ -458,56 +517,37 @@ class TradingBotGUI:
     def create_login_section(self, parent_frame):
         login_frame = ttk.LabelFrame(parent_frame, text="Controle do Bot")
         login_frame.pack(padx=10, pady=10, fill="x")
-
-        # --- Seção de Ativação de Licença ---
         license_frame = ttk.LabelFrame(login_frame, text="Ativação de Licença")
         license_frame.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
-
         ttk.Label(license_frame, text="Chave de Licença:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
         self.license_key_entry = ttk.Entry(license_frame, width=30)
         self.license_key_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-
         self.activate_button = ttk.Button(license_frame, text="Ativar Licença", command=self.handle_activation)
         self.activate_button.grid(row=1, column=0, columnspan=2, pady=5)
-        
         self.license_status_label = ttk.Label(license_frame, text="Status: Aguardando...", foreground="orange")
         self.license_status_label.grid(row=2, column=0, columnspan=2, pady=5)
-        # --- Fim Seção de Ativação ---
-
-        # Adiciona a entrada de usuário e senha
-        # Note que a grid row/column aqui é relativa ao 'login_frame' principal
         ttk.Label(login_frame, text="Usuário:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
         self.user_entry = ttk.Entry(login_frame, width=30)
         self.user_entry.insert(0, bot_config.user)
         self.user_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-
         ttk.Label(login_frame, text="Senha:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
         self.pass_entry = ttk.Entry(login_frame, width=30, show="*")
         self.pass_entry.insert(0, bot_config.password)
         self.pass_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
-
-        # ESTES BOTÕES E LABELS DEVEM SER CRIADOS ANTES DE check_license_status()
         self.connect_button = ttk.Button(login_frame, text="Conectar e Iniciar Alertas", command=self.start_bot_alert, state=tk.DISABLED)
         self.connect_button.grid(row=3, column=0, columnspan=2, pady=5)
-
         self.disconnect_button = ttk.Button(login_frame, text="Parar Alertas", command=self.stop_bot_alert, state=tk.DISABLED)
         self.disconnect_button.grid(row=4, column=0, columnspan=2, pady=5)
-
         self.connection_status_label = ttk.Label(login_frame, text="Status Conexão: Desconectado", foreground="red")
         self.connection_status_label.grid(row=5, column=0, columnspan=2, pady=5)
-
         account_type_frame = ttk.Frame(login_frame)
         account_type_frame.grid(row=6, column=0, columnspan=2, pady=5)
-
         ttk.Label(account_type_frame, text="Tipo de Conta:").pack(side="left", padx=5)
         self.account_type_var = tk.StringVar(value=bot_config.account_type)
         self.real_radio = ttk.Radiobutton(account_type_frame, text="Real", variable=self.account_type_var, value="REAL", command=self.change_account_type, state=tk.DISABLED)
         self.real_radio.pack(side="left", padx=5)
         self.practice_radio = ttk.Radiobutton(account_type_frame, text="Prática", variable=self.account_type_var, value="PRACTICE", command=self.change_account_type, state=tk.DISABLED)
         self.practice_radio.pack(side="left", padx=5)
-
-        # AGORA, E SOMENTE AGORA, CHAMAMOS A FUNÇÃO PARA VERIFICAR O STATUS DA LICENÇA
-        # TODOS OS WIDGETS JÁ FORAM CRIADOS NESTE PONTO.
         self.check_license_status()
 
     def check_license_status(self):
@@ -536,7 +576,7 @@ class TradingBotGUI:
         self.license_key_entry.config(state=tk.DISABLED)
         self.license_status_label.config(text="Status: Ativando, aguarde...", foreground="blue")
         self.master.update_idletasks()
-        if activate_license(license_key):
+        if activate_license_on_server(license_key):
             self.license_manager.save_license(license_key)
             self.check_license_status()
             messagebox.showinfo("Sucesso", "Licença ativada com sucesso! Você já pode iniciar o bot.")
@@ -586,15 +626,17 @@ class TradingBotGUI:
     def create_alert_log_section(self, parent_frame):
         alert_log_frame = ttk.LabelFrame(parent_frame, text="Alertas de Cruzamento EMA (Tempo Real)")
         alert_log_frame.pack(padx=10, pady=10, fill="both", expand=True)
-        self.alert_tree = ttk.Treeview(alert_log_frame, columns=("Hora", "Ativo", "Direção", "Estratégia"), show="headings", height=10)
+        self.alert_tree = ttk.Treeview(alert_log_frame, columns=("Hora", "Ativo", "Direção", "Estratégia", "Reversão Predita"), show="headings", height=10)
         self.alert_tree.heading("Hora", text="Hora")
         self.alert_tree.heading("Ativo", text="Ativo")
         self.alert_tree.heading("Direção", text="Direção")
         self.alert_tree.heading("Estratégia", text="Estratégia")
+        self.alert_tree.heading("Reversão Predita", text="Reversão Predita")
         self.alert_tree.column("Hora", width=80, anchor="center")
         self.alert_tree.column("Ativo", width=80, anchor="center")
         self.alert_tree.column("Direção", width=80, anchor="center")
         self.alert_tree.column("Estratégia", width=180, anchor="center")
+        self.alert_tree.column("Reversão Predita", width=100, anchor="center")
         self.alert_tree.pack(fill="both", expand=True, padx=5, pady=5)
 
     def create_reversal_history_section(self, parent_frame):
@@ -751,12 +793,14 @@ class TradingBotGUI:
 
     def _add_new_alert_to_treeview(self, alert_data):
         self.alert_history_count += 1
-        self.alert_tree.insert("", 0, iid=f"alert_{self.alert_history_count}", values=(
+        values = [
             alert_data['hora'],
             alert_data['ativo'],
             alert_data['direcao'],
-            alert_data['estrategia']
-        ))
+            alert_data['estrategia'],
+            alert_data.get('reversao_predita', 'N/A')
+        ]
+        self.alert_tree.insert("", 0, iid=f"alert_{self.alert_history_count}", values=values)
         max_alerts_to_show = 20
         if len(self.alert_tree.get_children()) > max_alerts_to_show:
             oldest_item = self.alert_tree.get_children()[-1]
